@@ -1,4 +1,3 @@
-
 name: Bidirectional Selected File Sync
 
 on:
@@ -12,10 +11,13 @@ permissions:
 
 jobs:
   sync:
-    # Prevent synchronization commits from triggering another sync.
+    # Allow manual runs. Skip pushes created by this workflow to prevent loops.
     if: >-
-      github.event.deleted != true &&
-      !contains(github.event.head_commit.message, '[repo-sync]')
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.deleted != true &&
+        !contains(github.event.head_commit.message || '', '[repo-sync]')
+      )
 
     runs-on: ubuntu-latest
 
@@ -35,50 +37,120 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [[ -z "${TOKEN}" || -z "${TARGET_REPO}" ]]; then
+            echo "SYNC_TOKEN and SYNC_REPO must both be configured."
+            exit 1
+          fi
+
           git clone \
             "https://x-access-token:${TOKEN}@github.com/${TARGET_REPO}.git" \
             target
 
-      # 3. Synchronize only explicitly approved files.
+      # 3. Copy only approved files that changed in this push.
+      #    A manual run copies all existing tracked files matching the allowlist.
       - name: Copy approved changed files
         env:
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
-
+          EVENT_NAME: ${{ github.event_name }}
           SYNC_FILES: |
+            # Cline rules
             .cline/rules/*
+          
+            # GitHub Actions workflows
+            .github/workflows/sync.yml
+            .github/workflows/sync.yaml
+          
+            # Other files
             .github/copilot-instructions.md
             README.md
-
         shell: bash
         run: |
           set -euo pipefail
 
-          # Get changed files, or all tracked files on a manual run.
-          if [[ -n "$BEFORE" && ! "$BEFORE" =~ ^0+$ ]]; then
+          # On a push, get added/copied/modified/renamed/type-changed files.
+          # On a manual run (or the first push), inspect all tracked files.
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || -z "$BEFORE" || "$BEFORE" =~ ^0+$ ]]; then
+
+            echo "Manual synchronization: inspecting all tracked files."
+          
             mapfile -d '' -t CHANGED_FILES < <(
-              git diff --name-only -z \
-                --diff-filter=ACMRT "$BEFORE" "$AFTER"
+              git ls-tree -r -z --name-only "$AFTER"
             )
+          
+            echo "Tracked files under .cline/rules:"
+            git ls-tree -r --name-only "$AFTER" -- .cline/rules
+          
+            echo "Total tracked files found: ${#CHANGED_FILES[@]}"
+          
           else
+          
+            echo "Push synchronization: inspecting changed files."
+          
             mapfile -d '' -t CHANGED_FILES < <(
-              git ls-files -z
+              git diff --name-only -z --diff-filter=ACMRT "$BEFORE" "$AFTER"
             )
+          
           fi
 
-          # Read approved paths and glob patterns.
+          # Convert path globs to regular expressions:
+          #   *  matches within one path component (not across /)
+          #   ** matches across path components, including /.
+          #   ?  matches one character other than /.
+          glob_to_regex() {
+            local glob="$1"
+            local regex='^'
+            local i=0 char next
+
+            while (( i < ${#glob} )); do
+              char="${glob:i:1}"
+              next="${glob:i+1:1}"
+
+              case "$char" in
+                '*')
+                  if [[ "$next" == '*' ]]; then
+                    regex+='.*'
+                    i=$((i + 2))
+                  else
+                    regex+='[^/]*'
+                    i=$((i + 1))
+                  fi
+                  ;;
+                '?')
+                  regex+='[^/]'
+                  i=$((i + 1))
+                  ;;
+                '.'|'+'|'('|')'|'['|']'|'{'|'}'|'^'|'$'|'|')
+                  regex+="\\${char}"
+                  i=$((i + 1))
+                  ;;
+                *)
+                  regex+="$char"
+                  i=$((i + 1))
+                  ;;
+              esac
+            done
+
+            printf '%s$' "$regex"
+          }
+
+          # Read approved paths and compile their glob patterns once.
           mapfile -t PATTERNS <<< "$SYNC_FILES"
+          declare -a PATTERN_REGEXES=()
+
+          for pattern in "${PATTERNS[@]}"; do
+            [[ -z "$pattern" || "$pattern" == \#* ]] && continue
+            PATTERN_REGEXES+=("$(glob_to_regex "$pattern")")
+          done
 
           for source_file in "${CHANGED_FILES[@]}"; do
             [[ -z "$source_file" ]] && continue
 
-            # Match against the approved file patterns.
+            # Match the changed path against the allowlist.
             approved=false
 
-            for pattern in "${PATTERNS[@]}"; do
-              [[ -z "$pattern" || "$pattern" == \#* ]] && continue
-
-              if [[ "$source_file" == $pattern ]]; then
+            for pattern_regex in "${PATTERN_REGEXES[@]}"; do
+              if [[ "$source_file" =~ $pattern_regex ]]; then
                 approved=true
                 break
               fi
@@ -86,12 +158,39 @@ jobs:
 
             [[ "$approved" == false ]] && continue
 
-            # Skip missing files, including deletions.
+            # Do not propagate deletions or missing source files.
             [[ ! -f "$source_file" ]] && continue
 
+            # Create the destination directory and copy to the same relative path.
             mkdir -p "target/$(dirname "$source_file")"
             cp -p -- "$source_file" "target/$source_file"
             git -C target add -- "$source_file"
 
             echo "Synchronized: $source_file"
           done
+
+      # 4. Commit and push staged changes to the destination's default branch.
+      - name: Commit and push synchronized files
+        run: |
+          set -euo pipefail
+
+          git -C target config user.name "github-actions[bot]"
+          git -C target config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git -C target diff --cached --quiet; then
+            echo "No approved file changes to synchronize."
+            exit 0
+          fi
+
+          TARGET_BRANCH="$(git -C target branch --show-current)"
+
+          if [[ -z "$TARGET_BRANCH" ]]; then
+            echo "Could not determine the destination's checked-out branch."
+            exit 1
+          fi
+
+          git -C target commit -m "[repo-sync] Update approved files"
+          git -C target push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+
+          echo "Synchronization completed successfully."
